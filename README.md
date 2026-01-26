@@ -91,7 +91,7 @@ python SitUpCounter_Simple.py
 ## 🏗️ Project Structure
 
 ```
-burhan/
+
 ├── main.py                    # Application launcher with menu
 ├── SitUpGUI.py                # Full GUI application
 ├── SitUpCounter_Simple.py     # Lightweight standalone version
@@ -185,7 +185,6 @@ The `PoseModule.py` implements a custom pose detection system:
 
 ## 🎓 Project Information
 
-**Course**: PBL-CP-II  
 **Project**: Human Activity Monitoring System  
 **Date**: December 2025  
 **Focus**: Real-time exercise monitoring using computer vision
