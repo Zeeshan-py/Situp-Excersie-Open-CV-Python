@@ -1,202 +1,134 @@
-# Sit-Up Exercise Monitor
+# Sit-Up Monitor
 
-A real-time sit-up counter and exercise monitoring system using computer vision and pose detection. This project provides automated sit-up counting with form analysis and quality assessment.
+Production-ready sit-up counter and form monitor built with OpenCV, MediaPipe Pose, and Tkinter. The project now uses MediaPipe's 33 landmark model end-to-end and removes all background subtraction and contour-based body hacks.
 
-## 🎯 Features
+## Highlights
 
-- **Real-time Sit-Up Counting**: Automatically counts sit-ups using hip angle analysis
-- **Form Quality Assessment**: Provides feedback on exercise form (Good Form, Poor Form)
-- **Multiple Input Sources**: Supports both webcam and video file input
-- **Dual Interface Options**:
-  - **GUI Version**: Full-featured interface with video controls, statistics dashboard, and file management
-  - **Simple Version**: Lightweight standalone application for quick sessions
-- **Advanced Pose Detection**: Uses background subtraction and contour analysis for accurate body tracking
-- **Performance Metrics**: Tracks rep count, time elapsed, and form quality statistics
-- **Visual Feedback**: Real-time angle visualization and body landmark detection
+- MediaPipe Pose with landmark smoothing and confidence filtering
+- Robust sit-up state machine: `UNKNOWN -> LYING -> RISING -> SITTING -> LOWERING -> LYING`
+- Rep counting only after a full lying-to-sitting-to-lying cycle
+- Form-quality scoring with knee-angle, range-of-motion, smoothness, and ankle-stability checks
+- Simple OpenCV app for quick sessions
+- Threaded Tkinter GUI for live monitoring and session review
 
-## 📋 Requirements
+## Requirements
 
-- Python 3.13 or higher
-- OpenCV >= 4.5.0
-- MediaPipe >= 0.8.9
-- Pillow >= 9.0.0
-- NumPy >= 1.21.0
+- Python 3.10+
+- Install dependencies with:
 
-## 🚀 Installation
-
-1. Clone or download this repository:
-```bash
-cd burhan
-```
-
-2. Install the required dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-## 💻 Usage
+## Dependencies
 
-### Quick Start - Launcher Menu
+```text
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+Pillow>=10.0.0
+numpy>=1.24.0
+```
 
-Run the main launcher to choose your preferred version:
+## File Structure
+
+```text
+main.py
+SitUpGUI.py
+SitUpCounter_Simple.py
+SitUpExercise.py
+PoseModule.py
+requirements.txt
+README.md
+```
+
+## Running the Project
+
+Launch the menu:
 
 ```bash
 python main.py
 ```
 
-This will display a menu with three options:
-1. **GUI Version** - Full-featured interface (Recommended)
-2. **Simple Version** - Lightweight standalone application
-3. **Exit**
+Run the simple OpenCV app directly:
 
-### Option 1: GUI Version (Recommended)
+```bash
+python SitUpCounter_Simple.py --source 0
+python SitUpCounter_Simple.py --source path/to/video.mp4
+```
 
-Launch the full GUI application:
+Run the Tkinter dashboard directly:
 
 ```bash
 python SitUpGUI.py
 ```
 
-**Features:**
-- Video file upload and playback
-- Start/Pause/Stop controls
-- Real-time statistics dashboard
-- Exercise history tracking
-- Reset functionality
+## Controls
 
-**GUI Controls:**
-- 📹 **Open Camera**: Start webcam feed
-- 📁 **Open Video File**: Load a video for analysis
-- ▶ **Start**: Begin monitoring
-- ⏸ **Pause**: Pause the session
-- ⏹ **Stop**: End the session
-- 🔄 **Reset**: Clear all statistics
+### Simple App
 
-### Option 2: Simple Version
+- `Q` or `Esc`: quit
+- `R`: reset session counters
+- `S`: save a timestamped screenshot
 
-Launch the lightweight version:
+### GUI App
 
-```bash
-python SitUpCounter_Simple.py
-```
+- `📹 Camera`: choose webcam input
+- `📁 Video`: choose a video file
+- `▶ Start`: begin processing
+- `⏸ Pause`: pause or resume
+- `⏹ Stop`: end the session
+- `🔄 Reset`: clear metrics and history
 
-**Features:**
-- Webcam or video file input
-- Real-time counting display
-- Minimal resource usage
-- Keyboard controls:
-  - `ESC` or `Q`: Exit
-  - `R`: Reset counter
+## Camera Setup Recommendations
 
-## 🏗️ Project Structure
+Best accuracy comes from:
 
-```
+- Side view with the camera at roughly 90 degrees to body direction
+- Full body visible in frame
+- Good lighting without strong backlight
+- Uncluttered background
+- Camera placed near hip height
 
-├── main.py                    # Application launcher with menu
-├── SitUpGUI.py                # Full GUI application
-├── SitUpCounter_Simple.py     # Lightweight standalone version
-├── SitUpExercise.py           # Sit-up monitoring logic
-├── PoseModule.py              # Pose detection module
-├── requirements.txt           # Python dependencies
-└── __pycache__/              # Python cache files
-```
+## Detection Reliability Rules
 
-## 🔧 How It Works
+- Frames are skipped when MediaPipe detects no pose
+- Frames are skipped when active-side landmarks fall below visibility threshold
+- Hip angle is smoothed with an exponential moving average
+- State changes require three consecutive confirming frames
+- Hysteresis prevents bounce counts near threshold boundaries
 
-1. **Pose Detection**: Uses computer vision techniques including:
-   - Background subtraction (MOG2 algorithm)
-   - Contour analysis for body detection
-   - Landmark estimation for body keypoints
+## Metrics
 
-2. **Angle Calculation**: Measures hip angle using shoulder-hip-knee alignment
+- `REPS`: completed repetitions
+- `ANGLE`: current smoothed hip angle
+- `STATE`: current state-machine stage
+- `FORM`: live form feedback
+- `PACE`: reps per minute over the last 60 seconds
+- `SCORE`: good reps divided by total reps
 
-3. **Sit-Up Detection**: 
-   - **Lying Position**: Hip angle > 140°
-   - **Sitting Position**: Hip angle < 120°
-   - Counter increments when transitioning from lying to sitting
+## Troubleshooting
 
-4. **Form Assessment**: Analyzes movement quality and provides real-time feedback
+### Camera will not open
 
-## 📊 Key Metrics
+- Make sure another application is not using the webcam
+- Try a different camera index if your default camera is not index `0`
+- Reconnect the camera if the feed stops mid-session
 
-- **Rep Count**: Number of completed sit-ups
-- **Hip Angle**: Real-time angle measurement (shoulder-hip-knee)
-- **Form Quality**: Good form vs. poor form tracking
-- **Time Elapsed**: Session duration
-- **Average Pace**: Reps per minute
+### Tracking looks unreliable
 
-## 🎨 GUI Interface Overview
+- Reposition the camera to a true side view
+- Keep ankles, knees, hips, and shoulders visible at all times
+- Reduce motion blur with better lighting
 
-The GUI application features:
-- **Large video display area**: Shows real-time feed with overlay graphics
-- **Control panel**: Easy-to-use buttons for all functions
-- **Statistics dashboard**: 
-  - Current rep count
-  - Hip angle display
-  - Time elapsed
-  - Form feedback
-  - Quality metrics
-- **Status indicators**: Visual feedback on system state
+### GUI feels slow
 
-## 🔬 Technical Details
+- Close other apps using the webcam
+- Use the simple app on lower-spec machines
+- Lower the input resolution if needed
 
-### Pose Detection Algorithm
+## Architecture Notes
 
-The `PoseModule.py` implements a custom pose detection system:
-- Background subtraction for person segmentation
-- Contour-based body region detection
-- Proportional body landmark estimation
-- Smoothing algorithms for stable tracking
-
-### Angle Thresholds
-
-- **Sit Threshold**: 120° (below = sitting position)
-- **Lie Threshold**: 140° (above = lying position)
-- **Hysteresis**: 5° (prevents rapid state changes)
-
-## 🐛 Troubleshooting
-
-**Camera not detected:**
-- Ensure your webcam is properly connected
-- Check if another application is using the camera
-- Try running as administrator (Windows)
-
-**Poor detection accuracy:**
-- Ensure good lighting conditions
-- Position yourself in the center of the frame
-- Maintain clear visibility of shoulders, hips, and knees
-- Avoid cluttered backgrounds
-
-**Performance issues:**
-- Close other applications to free up resources
-- Use the Simple version for lower-spec systems
-- Reduce video resolution if possible
-
-## 📝 Notes
-
-- Best results achieved with:
-  - Good lighting conditions
-  - Uncluttered background
-  - Side-view camera angle
-  - Full body visibility
-  
-- The system builds a background model during the first ~30 frames
-- Hip angle is calculated using the right side of the body (landmarks 12-24-26)
-
-## 🎓 Project Information
-
-**Project**: Human Activity Monitoring System  
-**Date**: December 2025  
-**Focus**: Real-time exercise monitoring using computer vision
-
-## 📄 License
-
-This project is developed for educational purposes as part of the PBL-CP-II course.
-
-## 🤝 Contributing
-
-This is an academic project. For suggestions or improvements, feel free to fork and experiment!
-
----
-
-**Made with 💪 for fitness tracking and computer vision learning**
+- `PoseModule.py` wraps MediaPipe Pose and exposes safe landmark and angle helpers
+- `SitUpExercise.py` contains the shared state machine, form analysis, and HUD renderer
+- `SitUpCounter_Simple.py` runs the OpenCV-only experience
+- `SitUpGUI.py` runs threaded capture and updates the Tkinter dashboard through a queue

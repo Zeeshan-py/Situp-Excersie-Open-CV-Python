@@ -1,264 +1,327 @@
-"""
-Pose Module - Using Background Subtraction and Contour Analysis
-Improved pose detection for sit-up tracking
-"""
+"""Production pose detection utilities powered by MediaPipe pose backends."""
+
+from __future__ import annotations
+
+import logging
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import cv2
+import mediapipe as mp
 import numpy as np
-import math
+
+CONFIG: Dict[str, float | int | bool | str] = {
+    "model_complexity": 1,
+    "smooth_landmarks": True,
+    "min_detection_confidence": 0.6,
+    "min_tracking_confidence": 0.6,
+    "default_visibility_threshold": 0.5,
+    "task_model_url": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+}
+
+LOGGER = logging.getLogger(__name__)
+
+LandmarkData = Tuple[int, int, float, float]
+
+
+@dataclass(frozen=True)
+class DrawingSpecConfig:
+    """Encapsulates landmark drawing colors and sizes."""
+
+    landmark_color: Tuple[int, int, int] = (0, 255, 0)
+    connection_color: Tuple[int, int, int] = (0, 180, 0)
+    landmark_radius: int = 3
+    landmark_thickness: int = 2
+    connection_thickness: int = 2
+
+
+def calculate_angle(
+    a: Tuple[int, int],
+    b: Tuple[int, int],
+    c: Tuple[int, int],
+) -> float:
+    """Calculate the angle in degrees at point ``b`` using stable vector math."""
+
+    ba = np.array(a, dtype=np.float32) - np.array(b, dtype=np.float32)
+    bc = np.array(c, dtype=np.float32) - np.array(b, dtype=np.float32)
+    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+    return float(angle)
 
 
 class PoseDetector:
-    """
-    Pose detection using advanced computer vision techniques
-    """
+    """Wrap MediaPipe pose estimation with a resilient, landmark-centric API."""
 
-    def __init__(self, mode=False, smooth=True,
-                 detectionCon=0.5, trackCon=0.5):
-        self.mode = mode
-        self.smooth = smooth
-        self.detectionCon = detectionCon
-        self.trackCon = trackCon
-        self.lmList = []
-        self.bboxInfo = {}
-        self.frame_count = 0
-        self.prev_angle = 90
-        self.movement_detected = False
-        
-        # Background subtractor for better person detection
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
-        self.use_bg_subtraction = False
-        self.background_frames = 0
-        
-    def findPose(self, img, draw=True):
-        """
-        Find pose using multiple detection methods
-        """
-        self.frame_count += 1
-        h, w = img.shape[:2]
-        
-        # Method 1: Use background subtraction if available
-        if self.frame_count > 30:  # Build background model first
-            self.use_bg_subtraction = True
-        
-        if self.use_bg_subtraction:
-            fg_mask = self.bg_subtractor.apply(img, learningRate=0.001)
-            # Clean up the mask
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-            
-            # Find contours in foreground mask
-            contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def __init__(self) -> None:
+        """Initialize the best available MediaPipe backend and drawing helpers."""
+
+        self._backend = "solutions"
+        self._mp_pose = None
+        self._mp_drawing = None
+        self._task_drawing_utils = None
+        self._task_connections = None
+        self._task_image_cls = None
+        self._task_image_format = None
+        self._pose = self._create_backend()
+        self._drawing_config = DrawingSpecConfig()
+        self._results: Optional[object] = None
+        self._landmarks: Dict[int, LandmarkData] = {}
+        self._last_frame_shape: Optional[Tuple[int, int]] = None
+
+    def get_landmarks(self, frame: np.ndarray) -> Dict[int, LandmarkData]:
+        """Run pose estimation and return landmark id to ``(x, y, z, visibility)``."""
+
+        if frame is None or frame.size == 0:
+            LOGGER.warning("Received an empty frame for landmark extraction.")
+            self._results = None
+            self._landmarks = {}
+            self._last_frame_shape = None
+            return {}
+
+        frame_height, frame_width = frame.shape[:2]
+        self._last_frame_shape = (frame_width, frame_height)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._results = self._run_inference(rgb_frame)
+        self._landmarks = {}
+
+        normalized_landmarks, world_landmarks = self._extract_pose_sets()
+        if normalized_landmarks is None:
+            return {}
+
+        for landmark_id, landmark in enumerate(normalized_landmarks):
+            world_landmark = (
+                world_landmarks[landmark_id]
+                if world_landmarks is not None and landmark_id < len(world_landmarks)
+                else None
+            )
+            visibility = getattr(landmark, "visibility", None)
+            if visibility is None:
+                visibility = getattr(landmark, "presence", 0.0)
+            z_value = world_landmark.z if world_landmark is not None else landmark.z
+            x_coord = int(np.clip(landmark.x * frame_width, 0, max(frame_width - 1, 0)))
+            y_coord = int(np.clip(landmark.y * frame_height, 0, max(frame_height - 1, 0)))
+            self._landmarks[landmark_id] = (
+                x_coord,
+                y_coord,
+                float(z_value),
+                float(visibility),
+            )
+
+        return dict(self._landmarks)
+
+    def draw_landmarks(self, frame: np.ndarray) -> np.ndarray:
+        """Draw the MediaPipe skeleton on the provided frame."""
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        if not self._results or not self._landmarks:
+            self.get_landmarks(frame)
+
+        landmark_spec = self._create_landmark_spec()
+        connection_spec = self._create_connection_spec()
+        normalized_landmarks, _ = self._extract_pose_sets()
+        if normalized_landmarks is None:
+            return frame
+
+        if self._backend == "solutions":
+            self._mp_drawing.draw_landmarks(
+                frame,
+                self._results.pose_landmarks,
+                self._mp_pose.POSE_CONNECTIONS,
+                landmark_spec,
+                connection_spec,
+            )
         else:
-            # Method 2: Use edge detection and contour finding
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            edges = cv2.Canny(blurred, 50, 150)
-            
-            # Dilate to connect edges
-            kernel = np.ones((5, 5), np.uint8)
-            edges = cv2.dilate(edges, kernel, iterations=2)
-            
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            # Get the largest contour (assumed to be the person)
-            largest_contour = max(contours, key=cv2.contourArea)
-            
-            if cv2.contourArea(largest_contour) > 5000:  # Minimum area threshold
-                # Get bounding box and center
-                x, y, bw, bh = cv2.boundingRect(largest_contour)
-                
-                # Calculate moments for better center detection
-                M = cv2.moments(largest_contour)
-                if M["m00"] != 0:
-                    body_center_x = int(M["m10"] / M["m00"])
-                    body_center_y = int(M["m01"] / M["m00"])
-                else:
-                    body_center_x = x + bw // 2
-                    body_center_y = y + bh // 2
-                
-                # Find the topmost and bottommost points
-                topmost = tuple(largest_contour[largest_contour[:, :, 1].argmin()][0])
-                bottommost = tuple(largest_contour[largest_contour[:, :, 1].argmax()][0])
-                leftmost = tuple(largest_contour[largest_contour[:, :, 0].argmin()][0])
-                rightmost = tuple(largest_contour[largest_contour[:, :, 0].argmax()][0])
-                
-                # Estimate body proportions
-                body_height = bottommost[1] - topmost[1]
-                body_width = rightmost[0] - leftmost[0]
-                
-                # Head (top 10% of body)
-                head_y = topmost[1] + int(body_height * 0.05)
-                
-                # Shoulders (approximately 18% from top)
-                shoulder_y = topmost[1] + int(body_height * 0.18)
-                left_shoulder_x = body_center_x - int(body_width * 0.20)
-                right_shoulder_x = body_center_x + int(body_width * 0.20)
-                
-                # Hips (approximately 45-50% from top)
-                hip_y = topmost[1] + int(body_height * 0.48)
-                left_hip_x = body_center_x - int(body_width * 0.15)
-                right_hip_x = body_center_x + int(body_width * 0.15)
-                
-                # Knees (approximately 70% from top)
-                knee_y = topmost[1] + int(body_height * 0.70)
-                left_knee_x = body_center_x - int(body_width * 0.12)
-                right_knee_x = body_center_x + int(body_width * 0.12)
-                
-                # Ankles (approximately 90% from top)
-                ankle_y = topmost[1] + int(body_height * 0.90)
-                
-                # Elbows (approximately 35% from top)
-                elbow_y = topmost[1] + int(body_height * 0.35)
-                left_elbow_x = body_center_x - int(body_width * 0.28)
-                right_elbow_x = body_center_x + int(body_width * 0.28)
-                
-                # Wrists (approximately 50% from top, wider)
-                wrist_y = topmost[1] + int(body_height * 0.50)
-                left_wrist_x = body_center_x - int(body_width * 0.35)
-                right_wrist_x = body_center_x + int(body_width * 0.35)
-                
-                # Create landmark list with improved positions
-                self.lmList = [
-                    [0, body_center_x, head_y, 0],  # 0: nose/head
-                    [1, body_center_x, head_y + 5, 0],  # 1: neck top
-                    [2, body_center_x - 15, head_y, 0],  # 2-10: face features
-                    [3, body_center_x - 20, head_y, 0],
-                    [4, body_center_x + 15, head_y, 0],
-                    [5, body_center_x + 20, head_y, 0],
-                    [6, body_center_x + 20, head_y, 0],
-                    [7, body_center_x - 30, head_y + 5, 0],
-                    [8, body_center_x + 30, head_y + 5, 0],
-                    [9, body_center_x - 8, head_y + 15, 0],
-                    [10, body_center_x + 8, head_y + 15, 0],
-                    [11, left_shoulder_x, shoulder_y, 0],  # 11: LEFT SHOULDER ***
-                    [12, right_shoulder_x, shoulder_y, 0],  # 12: RIGHT SHOULDER ***
-                    [13, left_elbow_x, elbow_y, 0],  # 13: left elbow
-                    [14, right_elbow_x, elbow_y, 0],  # 14: right elbow
-                    [15, left_wrist_x, wrist_y, 0],  # 15: left wrist
-                    [16, right_wrist_x, wrist_y, 0],  # 16: right wrist
-                    [17, left_wrist_x - 5, wrist_y + 10, 0],  # 17-22: hands
-                    [18, left_wrist_x, wrist_y + 10, 0],
-                    [19, left_wrist_x + 5, wrist_y + 10, 0],
-                    [20, right_wrist_x - 5, wrist_y + 10, 0],
-                    [21, right_wrist_x, wrist_y + 10, 0],
-                    [22, right_wrist_x + 5, wrist_y + 10, 0],
-                    [23, left_hip_x, hip_y, 0],  # 23: LEFT HIP ***
-                    [24, right_hip_x, hip_y, 0],  # 24: RIGHT HIP ***
-                    [25, left_knee_x, knee_y, 0],  # 25: LEFT KNEE ***
-                    [26, right_knee_x, knee_y, 0],  # 26: RIGHT KNEE ***
-                    [27, left_knee_x, ankle_y, 0],  # 27: left ankle
-                    [28, right_knee_x, ankle_y, 0],  # 28: right ankle
-                    [29, left_knee_x, bottommost[1], 0],  # 29: left heel
-                    [30, right_knee_x, bottommost[1], 0],  # 30: right heel
-                    [31, left_knee_x + 10, bottommost[1], 0],  # 31: left foot
-                ]
-                
-                self.movement_detected = True
-                
-                if draw:
-                    # Draw skeleton connections
-                    connections = [
-                        (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),  # Arms
-                        (11, 23), (12, 24), (23, 24),  # Torso
-                        (23, 25), (25, 27), (24, 26), (26, 28),  # Legs
-                    ]
-                    
-                    for connection in connections:
-                        if connection[0] < len(self.lmList) and connection[1] < len(self.lmList):
-                            pt1 = (self.lmList[connection[0]][1], self.lmList[connection[0]][2])
-                            pt2 = (self.lmList[connection[1]][1], self.lmList[connection[1]][2])
-                            cv2.line(img, pt1, pt2, (0, 255, 0), 3)
-                    
-                    # Draw key landmarks with labels
-                    key_points = {
-                        11: 'L.Shoulder', 12: 'R.Shoulder',
-                        23: 'L.Hip', 24: 'R.Hip',
-                        25: 'L.Knee', 26: 'R.Knee'
-                    }
-                    
-                    for i, lm in enumerate(self.lmList):
-                        if i in key_points:
-                            # Draw larger circles for key points
-                            cv2.circle(img, (lm[1], lm[2]), 8, (0, 0, 255), cv2.FILLED)
-                            cv2.circle(img, (lm[1], lm[2]), 10, (255, 255, 255), 2)
-                            # Add labels
-                            cv2.putText(img, key_points[i], (lm[1] + 12, lm[2] - 8),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                        else:
-                            # Regular landmarks
-                            cv2.circle(img, (lm[1], lm[2]), 4, (255, 255, 0), cv2.FILLED)
-                    
-                    # Draw contour outline
-                    cv2.drawContours(img, [largest_contour], -1, (0, 255, 255), 2)
-                    
-                    # Draw extreme points for reference
-                    cv2.circle(img, topmost, 8, (255, 0, 0), -1)
-                    cv2.circle(img, bottommost, 8, (255, 0, 0), -1)
-        
-        return img
+            self._task_drawing_utils.draw_landmarks(
+                frame,
+                normalized_landmarks,
+                self._task_connections,
+                landmark_spec,
+                connection_spec,
+            )
 
-    def findPosition(self, img, draw=True, bboxWithHands=False):
-        """
-        Get landmark positions
-        """
-        h, w, c = img.shape
-        
-        if len(self.lmList) == 0:
-            self.findPose(img, draw=False)
-        
-        # Calculate bounding box
-        if len(self.lmList) >= 32:
-            ad = abs(self.lmList[12][1] - self.lmList[11][1]) // 2
-            if bboxWithHands:
-                x1 = self.lmList[16][1] - ad
-                x2 = self.lmList[15][1] + ad
-            else:
-                x1 = self.lmList[12][1] - ad
-                x2 = self.lmList[11][1] + ad
+        return frame
 
-            y2 = self.lmList[29][2] + ad
-            y1 = self.lmList[1][2] - ad
-            bbox = (x1, y1, x2 - x1, y2 - y1)
-            cx, cy = bbox[0] + (bbox[2] // 2), bbox[1] + bbox[3] // 2
+    def get_angle(self, frame: np.ndarray, p1_id: int, p2_id: int, p3_id: int) -> float:
+        """Return the angle in degrees formed by three landmarks on the current frame."""
 
-            self.bboxInfo = {"bbox": bbox, "center": (cx, cy)}
+        if not self._landmarks and frame is not None and frame.size > 0:
+            self.get_landmarks(frame)
 
-            if draw:
-                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 255), 2)
-                cv2.circle(img, (cx, cy), 5, (255, 0, 0), cv2.FILLED)
+        point_a = self._get_point(p1_id)
+        point_b = self._get_point(p2_id)
+        point_c = self._get_point(p3_id)
+        if point_a is None or point_b is None or point_c is None:
+            return 0.0
 
-        return self.lmList, self.bboxInfo
+        return calculate_angle(point_a, point_b, point_c)
 
-    def findAngle(self, img, p1, p2, p3, draw=True):
-        """
-        Calculate angle between three points
-        """
-        if len(self.lmList) == 0:
-            return 0
+    def check_visibility(self, landmark_ids: List[int], threshold: float = 0.5) -> bool:
+        """Return ``True`` only when all requested landmarks exceed the visibility threshold."""
 
-        # Get the landmarks
-        x1, y1 = self.lmList[p1][1:3]
-        x2, y2 = self.lmList[p2][1:3]
-        x3, y3 = self.lmList[p3][1:3]
+        for landmark_id in landmark_ids:
+            landmark = self._landmarks.get(landmark_id)
+            if landmark is None or landmark[3] < threshold:
+                return False
+        return True
 
-        # Calculate the Angle
-        angle = math.degrees(math.atan2(y3 - y2, x3 - x2) -
-                             math.atan2(y1 - y2, x1 - x2))
-        if angle < 0:
-            angle += 360
+    def get_visibility_score(self, landmark_ids: List[int]) -> float:
+        """Return the average visibility of the requested landmarks."""
 
-        # Draw
-        if draw:
-            cv2.line(img, (x1, y1), (x2, y2), (255, 255, 255), 3)
-            cv2.line(img, (x3, y3), (x2, y2), (255, 255, 255), 3)
-            cv2.circle(img, (x1, y1), 10, (0, 0, 255), cv2.FILLED)
-            cv2.circle(img, (x1, y1), 15, (0, 0, 255), 2)
-            cv2.circle(img, (x2, y2), 10, (0, 0, 255), cv2.FILLED)
-            cv2.circle(img, (x2, y2), 15, (0, 0, 255), 2)
-            cv2.circle(img, (x3, y3), 10, (0, 0, 255), cv2.FILLED)
-            cv2.circle(img, (x3, y3), 15, (0, 0, 255), 2)
-            cv2.putText(img, str(int(angle)), (x2 - 50, y2 + 50),
-                        cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 255), 2)
-        return angle
+        visibilities = [
+            self._landmarks[landmark_id][3]
+            for landmark_id in landmark_ids
+            if landmark_id in self._landmarks
+        ]
+        if not visibilities:
+            return 0.0
+        return float(sum(visibilities) / len(visibilities))
+
+    def get_landmark(self, landmark_id: int) -> Optional[LandmarkData]:
+        """Return a landmark tuple when available."""
+
+        return self._landmarks.get(landmark_id)
+
+    def close(self) -> None:
+        """Release MediaPipe resources."""
+
+        if self._pose is not None and hasattr(self._pose, "close"):
+            self._pose.close()
+            self._pose = None
+
+    def _run_inference(self, rgb_frame: np.ndarray) -> object:
+        """Execute pose inference for the current backend."""
+
+        if self._backend == "solutions":
+            rgb_frame.flags.writeable = False
+            result = self._pose.process(rgb_frame)
+            rgb_frame.flags.writeable = True
+            return result
+
+        task_image = self._task_image_cls(
+            image_format=self._task_image_format.SRGB,
+            data=rgb_frame,
+        )
+        return self._pose.detect(task_image)
+
+    def _extract_pose_sets(self) -> Tuple[Optional[object], Optional[object]]:
+        """Return normalized and world landmark sequences for the current result."""
+
+        if self._results is None:
+            return None, None
+
+        if self._backend == "solutions":
+            if not getattr(self._results, "pose_landmarks", None):
+                return None, None
+            normalized_landmarks = self._results.pose_landmarks.landmark
+            world_landmarks = (
+                self._results.pose_world_landmarks.landmark
+                if getattr(self._results, "pose_world_landmarks", None)
+                else None
+            )
+            return normalized_landmarks, world_landmarks
+
+        if not getattr(self._results, "pose_landmarks", None):
+            return None, None
+        normalized_landmarks = self._results.pose_landmarks[0]
+        world_landmarks = (
+            self._results.pose_world_landmarks[0]
+            if getattr(self._results, "pose_world_landmarks", None)
+            else None
+        )
+        return normalized_landmarks, world_landmarks
+
+    def _create_backend(self) -> object:
+        """Create the best available MediaPipe pose backend."""
+
+        if hasattr(mp, "solutions") and hasattr(mp.solutions, "pose"):
+            self._mp_pose = mp.solutions.pose
+            self._mp_drawing = mp.solutions.drawing_utils
+            return self._mp_pose.Pose(
+                model_complexity=int(CONFIG["model_complexity"]),
+                smooth_landmarks=bool(CONFIG["smooth_landmarks"]),
+                min_detection_confidence=float(CONFIG["min_detection_confidence"]),
+                min_tracking_confidence=float(CONFIG["min_tracking_confidence"]),
+            )
+
+        LOGGER.info("MediaPipe solutions API unavailable; using Pose Landmarker Tasks backend.")
+        self._backend = "tasks"
+        from mediapipe.tasks.python.core.base_options import BaseOptions
+        from mediapipe.tasks.python.vision import drawing_utils as task_drawing_utils
+        from mediapipe.tasks.python.vision import pose_landmarker
+        from mediapipe.tasks.python.vision.core.image import Image
+        from mediapipe.tasks.python.vision.core.image import ImageFormat
+
+        model_path = self._ensure_task_model()
+        self._task_drawing_utils = task_drawing_utils
+        self._task_connections = pose_landmarker.PoseLandmarksConnections.POSE_LANDMARKS
+        self._task_image_cls = Image
+        self._task_image_format = ImageFormat
+        options = pose_landmarker.PoseLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(model_path)),
+            num_poses=1,
+            min_pose_detection_confidence=float(CONFIG["min_detection_confidence"]),
+            min_pose_presence_confidence=float(CONFIG["min_detection_confidence"]),
+            min_tracking_confidence=float(CONFIG["min_tracking_confidence"]),
+        )
+        return pose_landmarker.PoseLandmarker.create_from_options(options)
+
+    def _ensure_task_model(self) -> Path:
+        """Download the official pose landmarker task model when needed."""
+
+        cache_dir = Path.home() / ".situp_monitor"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        model_path = cache_dir / "pose_landmarker_full.task"
+        if not model_path.exists():
+            LOGGER.info("Downloading MediaPipe pose model to %s", model_path)
+            urllib.request.urlretrieve(str(CONFIG["task_model_url"]), model_path)
+        return model_path
+
+    def _create_landmark_spec(self) -> object:
+        """Build a landmark drawing spec for the active backend."""
+
+        if self._backend == "solutions":
+            return self._mp_drawing.DrawingSpec(
+                color=self._drawing_config.landmark_color,
+                thickness=self._drawing_config.landmark_thickness,
+                circle_radius=self._drawing_config.landmark_radius,
+            )
+        return self._task_drawing_utils.DrawingSpec(
+            color=self._drawing_config.landmark_color,
+            thickness=self._drawing_config.landmark_thickness,
+            circle_radius=self._drawing_config.landmark_radius,
+        )
+
+    def _create_connection_spec(self) -> object:
+        """Build a connection drawing spec for the active backend."""
+
+        if self._backend == "solutions":
+            return self._mp_drawing.DrawingSpec(
+                color=self._drawing_config.connection_color,
+                thickness=self._drawing_config.connection_thickness,
+                circle_radius=self._drawing_config.landmark_radius,
+            )
+        return self._task_drawing_utils.DrawingSpec(
+            color=self._drawing_config.connection_color,
+            thickness=self._drawing_config.connection_thickness,
+            circle_radius=self._drawing_config.landmark_radius,
+        )
+
+    def _get_point(self, landmark_id: int) -> Optional[Tuple[int, int]]:
+        """Return a 2D point for a landmark id when available."""
+
+        landmark = self._landmarks.get(landmark_id)
+        if landmark is None:
+            return None
+        return (landmark[0], landmark[1])
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for MediaPipe resources."""
+
+        try:
+            self.close()
+        except (AttributeError, RuntimeError):
+            LOGGER.debug("Pose detector cleanup skipped during interpreter shutdown.")
